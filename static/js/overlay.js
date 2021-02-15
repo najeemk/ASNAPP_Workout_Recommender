@@ -22,7 +22,7 @@ function openPlayerOverlay(videoIndex) {
 
     document.getElementById("overlay-display").style.display = "block";
 
-    }
+}
 
 
 function closePlayerOverlay() {

@@ -1,24 +1,38 @@
+from src.models.light_fm import light_fm, evaluate, pred_i
+from src.data.model_preprocessing import get_data
 import os
 from flask import send_from_directory
-from src.app.register import register_user
+from src.app.register import register_user, update_preferences
 from flask import Flask, render_template, redirect, url_for, session, g, request
-from src.app.forms import RegistrationForm, LoginForm
+from src.app.forms import RegistrationForm, LoginForm, WorkoutInformation
 from flask_mysqldb import MySQL
 from flask_bcrypt import Bcrypt
 import json
 import pandas as pd
-from src.app.recommendations import filter
+from src.app.recommendations import create_rec_lists, get_rec_sorted
+
+import sys
+sys.path.insert(0, 'src/data')
+sys.path.insert(0, 'src/models')
+
 
 app = Flask(__name__)
 
+is_prod = os.environ.get('IS_HEROKU', None)
+
+if is_prod:
+    app.config['MYSQL_HOST'] = os.environ.get('MYSQL_HOST')
+    app.config['MYSQL_USER'] = os.environ.get('MYSQL_USER')
+    app.config['MYSQL_PASSWORD'] = os.environ.get('MYSQL_PASSWORD')
+    app.config['MYSQL_DB'] = os.environ.get('MYSQL_DB')
+else:
+    db_config = json.load(open('./config/db_config.json'))
+    app.config['MYSQL_HOST'] = db_config['mysql_host']
+    app.config['MYSQL_USER'] = db_config['mysql_user']
+    app.config['MYSQL_PASSWORD'] = db_config['mysql_password']
+    app.config['MYSQL_DB'] = db_config['mysql_db']
+
 app.config['SECRET_KEY'] = 'dev'
-
-db_config = json.load(open('./config/db_config.json'))
-
-app.config['MYSQL_HOST'] = db_config['mysql_host']
-app.config['MYSQL_USER'] = db_config['mysql_user']
-app.config['MYSQL_PASSWORD'] = db_config['mysql_password']
-app.config['MYSQL_DB'] = db_config['mysql_db']
 
 db = MySQL(app)
 bcrypt = Bcrypt(app)
@@ -100,49 +114,66 @@ def recommendation_page():
     if g.user is None:
         return redirect(url_for('login_page'))
 
-    # # the model's predictions (list of workout_id)
-    # query = "SELECT workout_id FROM fbworkouts ORDER BY RAND() LIMIT 10"
-    # model_predictions = list(pd.read_sql_query(query , db.connection)['workout_id'])
-    #
-    # # get the workouts df for the predicted workouts
-    # query = "SELECT * FROM fbworkouts WHERE workout_id in (" + str(model_predictions)[1:-1] +")"
-    # workouts = pd.read_sql_query(query , db.connection)
-    #
-    # # filter for user preferences and split into recommentation lists for each body focus
-    # dct = filter(workouts, g.user)
-    # lst = [] # list of lists, where each list is recommendations for a body focuz
-    # for values in dct.values():
-    #     query = "SELECT * FROM fbworkouts_meta WHERE workout_id in (" + str(values)[1:-1] + ')'
-    #     list.append(pd.read_sql_query(query , db.connection))
+    rec_engine = request.form.get("engine")
+    if rec_engine is None:
+        return render_template("recommendation_page.html", rec_engine=None, rec_dct=None)
 
-    if request.method == "POST":
-        rec_engine = request.form.get("engine", "random")
-    else:
-        rec_engine = request.form.get("engine", "random")
-
-    print(rec_engine)
+    # get prediction and scores based on chosen model
     if rec_engine == "random":
-        query = "SELECT * FROM fbworkouts_meta ORDER BY RAND() LIMIT 10"
+        query = "SELECT workout_id, RAND() as score FROM fbworkouts_meta ORDER BY score"
+        results = pd.read_sql_query(query, db.connection)
+        pred, scores = list(results.iloc[:,0]), list(results.iloc[:,1])
     elif rec_engine == "toppop":
-        query = """SELECT *
-                FROM workout.fbworkouts_meta
-                WHERE workout.fbworkouts_meta.workout_id IN (
-                    SELECT TEMP.workout_id
-                    FROM
-                    (
-                        SELECT workout_id, COUNT(workout_id)
-                        FROM workout.user_item_interaction
-                        GROUP BY workout_id
-                        ORDER BY 2 DESC
-                        LIMIT 10
-                    ) AS TEMP
-                )"""
+        query = """
+                SELECT workout_id, COUNT(workout_id) AS score
+                FROM workout.user_item_interaction
+                GROUP BY workout_id
+                ORDER BY 2 DESC
+                """
+        results = pd.read_sql_query(query, db.connection)
+        pred, scores = list(results.iloc[:,0]), list(results.iloc[:,1])
     else:
-        query = "SELECT * FROM fbworkouts_meta ORDER BY RAND() LIMIT 0"
+        uii = pd.read_sql_query(
+            "SELECT * FROM user_item_interaction", db.connection)
+        data = get_data(uii)
+        pred, scores = pred_i(data, 69) # TODO: replace 69 with g.user.user_id
 
+    # dct for predictions to scores
+    pred_scores = {pred[i]:scores[i] for i in range(len(pred))}
+
+    # get fbworkouts dataframe
+    query = "SELECT * FROM fbworkouts"
     results = pd.read_sql_query(query, db.connection)
-    return render_template("recommendation_page.html", engine=rec_engine, workouts=results)
 
+    # dictionary with keys as body focus and values as filtered list of workouts
+    pred_dct = create_rec_lists(results, g.user)
+
+    # dictionary with keys as body focus and values as dataframes with
+    # fb_workouts_meta schema and rows sorted by scores
+    rec_dct = {}
+    for body_focus in pred_dct.keys():
+        query = "SELECT * FROM fbworkouts_meta WHERE workout_id IN (" + str(pred_dct[body_focus])[1:-1] + ")"
+        results = get_rec_sorted(pd.read_sql_query(query, db.connection), pred_scores)
+        rec_dct[body_focus.replace('_',' ').capitalize().replace('b','B')] = results
+    return render_template("recommendation_page.html", rec_engine=rec_engine, rec_dct=rec_dct)
+
+@app.route('/update', methods=['GET', 'POST'])
+def update():
+    form = WorkoutInformation()
+    if form.validate_on_submit(): # update user table based on form inputs
+        cur = db.connection.cursor()
+        cur.execute(*update_preferences(form, g.user.user_id))
+        db.connection.commit()
+        cur.close()
+        return redirect(url_for('recommendation_page'))
+
+    # create dictionary from user series in order to prepopulate form with previous preferences
+    user_dct = g.user[['equipment','training_type','min_duration','max_duration','min_calories',
+                            'max_calories','min_difficulty','max_difficulty']].to_dict()
+    for k,v in user_dct.items():
+        if type(v)!=str:
+            user_dct[k] = int(v)
+    return render_template('update_workout_info.html', form=form, user=user_dct)
 
 @app.route('/logout')
 def logout():
